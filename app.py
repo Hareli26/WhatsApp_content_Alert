@@ -8,6 +8,7 @@ Google Contacts autocomplete via vCard import.
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import threading
+import queue
 import time
 import subprocess
 import os
@@ -165,17 +166,210 @@ class ContactEntry:
         self._remove_btn = None
 
 
+# ── Browser thread ────────────────────────────────────────────────────────────
+
+class _BrowserThread(threading.Thread):
+    """
+    Long-lived thread that owns the Playwright instance.
+    ALL Playwright calls must go through call() so they execute
+    inside this thread.  Stays alive across Stop-All / Start-All cycles;
+    only exits when the app closes or the browser crashes.
+    """
+
+    def __init__(self, on_log, on_error):
+        super().__init__(daemon=True, name="PlaywrightThread")
+        self._on_log   = on_log    # callable(str)
+        self._on_error = on_error  # callable(str)
+        self._task_q   = queue.Queue()
+        self._shutdown = threading.Event()
+        self.ready     = threading.Event()
+        self.browser   = None
+        self.last_error: str = ""
+
+    # ── Class-level helper ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _clear_profile_locks(session_dir: str):
+        """
+        Remove Chrome singleton lock files left over from a crashed session.
+        Chrome exits with code 21 ("profile locked") if these exist.
+        """
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie",
+                     "lockfile", ".com.google.Chrome"):
+            try:
+                os.remove(os.path.join(session_dir, name))
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+    # ── Thread body ────────────────────────────────────────────────────────────
+
+    def run(self):
+        from playwright.sync_api import sync_playwright
+        try:
+            with sync_playwright() as pw:
+                session_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "wa_session")
+                os.makedirs(session_dir, exist_ok=True)
+
+                # Remove stale lock files so Chrome doesn't exit with code 21
+                self._clear_profile_locks(session_dir)
+
+                self._on_log(
+                    "Launching browser (first time only — scan QR if prompted)...")
+
+                # Try up to 3 times; a lock file may take a moment to release
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        self.browser = pw.chromium.launch_persistent_context(
+                            user_data_dir=session_dir,
+                            headless=False,
+                            args=["--no-sandbox",
+                                  "--disable-blink-features=AutomationControlled"],
+                            no_viewport=True,
+                        )
+                        last_err = None
+                        break           # success
+                    except Exception as e:
+                        last_err = e
+                        if attempt < 2:
+                            self._clear_profile_locks(session_dir)
+                            time.sleep(2)
+
+                if last_err is not None:
+                    self.last_error = str(last_err)
+                    self._on_error(f"Browser launch error: {last_err}")
+                    self.ready.set()
+                    return
+
+                pages      = self.browser.pages
+                main_page  = pages[0] if pages else self.browser.new_page()
+
+                if "web.whatsapp.com" not in main_page.url:
+                    main_page.goto("https://web.whatsapp.com",
+                                   wait_until="domcontentloaded")
+
+                self._on_log(
+                    "Waiting for WhatsApp Web... (scan QR code if asked)")
+                try:
+                    main_page.wait_for_selector(
+                        '[data-testid="chat-list"], #pane-side, '
+                        '[data-testid="chat-list-search"], '
+                        '[aria-label="Chat list"], div[role="grid"]',
+                        timeout=120_000)
+                except Exception:
+                    self.last_error = "Timed out waiting for WhatsApp Web"
+                    self._on_error("ERROR: Timed out waiting for WhatsApp Web")
+                    self.ready.set()
+                    return
+
+                self._on_log("WhatsApp Web ready ✓  (browser minimized)")
+                time.sleep(1)
+                _minimize_window_containing("WhatsApp")
+                self.ready.set()
+
+                # ── Task loop — never exits until shutdown ────────────────────
+                while not self._shutdown.is_set():
+                    try:
+                        fn, box, done_ev = self._task_q.get(timeout=0.4)
+                        try:
+                            box["result"] = fn()
+                        except Exception as exc:
+                            box["error"] = exc
+                        finally:
+                            done_ev.set()
+                    except queue.Empty:
+                        pass
+
+        except Exception as exc:
+            self.last_error = str(exc)
+            self._on_error(f"Browser error: {exc}")
+            self.ready.set()
+
+    # ── Public helpers ────────────────────────────────────────────────────────
+
+    def call(self, fn):
+        """
+        Run fn() inside the Playwright thread.
+        Blocks the calling thread until done; re-raises exceptions.
+        """
+        box     = {}
+        done_ev = threading.Event()
+        self._task_q.put((fn, box, done_ev))
+        done_ev.wait()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+    def open_page(self) -> object:
+        """
+        Open a new WhatsApp Web tab.  Returns only after:
+          1. Side panel container is visible
+          2. Search box is present (UI is interactive)
+          3. At least ONE contact row has appeared (list is populated)
+          4. Any open chat is dismissed via Escape + settle delay
+        This ensures the tab is truly ready before _open_chat runs.
+        """
+        def _open():
+            p = self.browser.new_page()
+            p.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
+
+            # 1 ── side panel container
+            p.wait_for_selector(
+                '[data-testid="chat-list"], #pane-side, div[role="grid"]',
+                timeout=60_000)
+
+            # 2 ── search box in the left panel (proves UI is interactive)
+            try:
+                p.wait_for_selector(
+                    '#pane-side div[contenteditable="true"], '
+                    '[data-testid="chat-list-search"]',
+                    timeout=15_000)
+            except Exception:
+                pass
+
+            # 3 ── wait until at least one contact row is rendered
+            try:
+                p.wait_for_selector(
+                    '#pane-side span[title], '
+                    '#pane-side [data-testid*="cell"], '
+                    '#pane-side [data-testid*="chat"]',
+                    timeout=20_000)
+                time.sleep(0.8)   # let the rest of the list render
+            except Exception:
+                time.sleep(2.0)   # fallback settle time
+
+            # 4 ── dismiss any open chat, then final settle
+            for _ in range(2):
+                try:
+                    p.keyboard.press("Escape")
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+            time.sleep(0.8)
+            return p
+        return self.call(_open)
+
+    def close_page(self, page):
+        """Close a tab safely inside the Playwright thread."""
+        try:
+            self.call(page.close)
+        except Exception:
+            pass
+
+    def shutdown(self):
+        self._shutdown.set()
+
+
 # ── Main application ──────────────────────────────────────────────────────────
 
 class WhatsAppMonitor:
 
     def __init__(self):
-        self.contacts: list         = []   # list[ContactEntry]
-        self._browser_lock          = threading.Lock()
-        self.browser                = None
-        self.main_page              = None
-        self._pw_ctx                = None
-        self._browser_ready         = False
+        self.contacts: list = []   # list[ContactEntry]
+        self._bw: _BrowserThread = None   # persistent browser thread
 
         cfg = load_config()
         self._google_contacts: list = cfg.get("google_contacts", [])
@@ -541,6 +735,15 @@ class WhatsAppMonitor:
         if not self.contacts:
             messagebox.showwarning("No contacts", "Add at least one contact first.")
             return
+
+        # Start (or reuse) the persistent browser thread
+        if not self._bw or not self._bw.is_alive():
+            self._bw = _BrowserThread(
+                on_log=lambda msg: self.root.after(0, lambda m=msg: self._log(m)),
+                on_error=lambda msg: self.root.after(0, lambda m=msg: self._log(m)),
+            )
+            self._bw.start()
+
         started = 0
         for entry in self.contacts:
             if entry.status in ("idle", "stopped", "error", "offline", "not found"):
@@ -555,6 +758,7 @@ class WhatsAppMonitor:
             entry.stop_event.set()
             if entry.status in ("starting", "monitoring", "online"):
                 self._update_contact_status(entry, "stopped")
+        # Keep _bw alive so the browser stays open for the next Start All
         self._update_count_and_buttons()
         self._log("Stopped all monitoring")
 
@@ -566,125 +770,72 @@ class WhatsAppMonitor:
         entry.thread = t
         t.start()
 
-    # ── Browser / Playwright ──────────────────────────────────────────────────
-
-    def _browser_alive(self) -> bool:
-        try:
-            self.main_page.evaluate("1")
-            return True
-        except Exception:
-            return False
-
-    def _ensure_browser(self, entry: ContactEntry) -> bool:
-        """Open browser and wait for WhatsApp Web. Thread-safe via lock."""
-        with self._browser_lock:
-            if self._browser_ready and self._browser_alive():
-                return True
-
-            from playwright.sync_api import sync_playwright
-
-            self._browser_ready = False
-            self.root.after(0, lambda: self._log(
-                "Launching browser (first time only — scan QR if prompted)..."))
-
-            session_dir = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "wa_session")
-            os.makedirs(session_dir, exist_ok=True)
-
-            if self._pw_ctx is None:
-                self._pw_ctx = sync_playwright().start()
-
-            try:
-                self.browser = self._pw_ctx.chromium.launch_persistent_context(
-                    user_data_dir=session_dir,
-                    headless=False,
-                    args=["--no-sandbox",
-                          "--disable-blink-features=AutomationControlled"],
-                    no_viewport=True,
-                )
-            except Exception as e:
-                self.root.after(0, lambda: self._log(f"Browser launch error: {e}"))
-                return False
-
-            pages          = self.browser.pages
-            self.main_page = pages[0] if pages else self.browser.new_page()
-
-            if "web.whatsapp.com" not in self.main_page.url:
-                self.main_page.goto(
-                    "https://web.whatsapp.com", wait_until="domcontentloaded")
-
-            self.root.after(0, lambda: self._log(
-                "Waiting for WhatsApp Web... (scan QR code if asked)"))
-            try:
-                self.main_page.wait_for_selector(
-                    '[data-testid="chat-list"], #pane-side, '
-                    '[data-testid="chat-list-search"], '
-                    '[aria-label="Chat list"], div[role="grid"]',
-                    timeout=120_000)
-            except Exception:
-                if entry.stop_event.is_set():
-                    return False
-                self.root.after(0, lambda: self._log(
-                    "ERROR: Timed out waiting for WhatsApp Web"))
-                return False
-
-            self._browser_ready = True
-            self.root.after(0, lambda: self._log(
-                "WhatsApp Web ready ✓ (browser minimized)"))
-            time.sleep(1)
-            _minimize_window_containing("WhatsApp")
-            return True
-
-    def _get_page_for(self, entry: ContactEntry):
-        """Return the existing browser tab for this contact, or open a new one."""
-        if entry.page is not None:
-            try:
-                entry.page.evaluate("1")
-                return entry.page
-            except Exception:
-                entry.page = None
-
-        try:
-            p = self.browser.new_page()
-            p.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
-            p.wait_for_selector(
-                '[data-testid="chat-list"], #pane-side, div[role="grid"]',
-                timeout=30_000)
-            entry.page = p
-            return p
-        except Exception as e:
-            self.root.after(0, lambda: self._log(
-                f"Tab error [{entry.name}]: {e}"))
-            return None
+    # ── Monitor loop ──────────────────────────────────────────────────────────
 
     def _run_monitor(self, entry: ContactEntry):
+        """
+        Runs in a plain thread.
+        All Playwright operations are dispatched to _bw (the browser thread)
+        via _bw.call() so we never touch Playwright from this thread directly.
+        This avoids the greenlet / 'cannot switch to a different thread' error.
+        """
+        bw = self._bw
+        nm = entry.name
         try:
-            if not self._ensure_browser(entry):
+            # ── Wait for browser to be ready (QR scan may take up to 2 min) ──
+            if not bw.ready.wait(timeout=135):
+                self.root.after(0, lambda: self._log(
+                    f"Timeout waiting for browser [{nm}]"))
                 self.root.after(0, lambda: self._update_contact_status(entry, "error"))
                 return
+
+            if bw.last_error:
+                self.root.after(0, lambda: self._update_contact_status(entry, "error"))
+                return
+
             if entry.stop_event.is_set():
                 return
 
-            page = self._get_page_for(entry)
-            if page is None:
+            # ── Open a dedicated tab for this contact ─────────────────────────
+            self.root.after(0, lambda: self._log(f"Opening tab for {nm}..."))
+            try:
+                page = bw.open_page()
+            except Exception as e:
+                self.root.after(0, lambda: self._log(f"Tab error [{nm}]: {e}"))
                 self.root.after(0, lambda: self._update_contact_status(entry, "error"))
                 return
 
-            nm = entry.name
-            self.root.after(0, lambda: self._log(f"Searching for {nm}..."))
+            entry.page = page
 
-            if not self._open_chat(page, nm):
-                self.root.after(0, lambda: self._log(f"Not found: {nm} — check the name"))
+            if entry.stop_event.is_set():
+                bw.close_page(page)
+                entry.page = None
+                return
+
+            # ── Find the chat ─────────────────────────────────────────────────
+            self.root.after(0, lambda: self._log(f"Searching for {nm}..."))
+            try:
+                found = bw.call(lambda: self._open_chat(page, nm))
+            except Exception as e:
+                self.root.after(0, lambda: self._log(f"Error opening chat [{nm}]: {e}"))
+                found = False
+
+            if not found:
+                self.root.after(0, lambda: self._log(
+                    f"Not found: {nm} — check the spelling"))
                 self.root.after(0, lambda: self._update_contact_status(entry, "not found"))
+                bw.close_page(page)
+                entry.page = None
                 return
 
             self.root.after(0, lambda: self._log(f"Monitoring {nm}"))
             self.root.after(0, lambda: self._update_contact_status(entry, "monitoring"))
 
+            # ── Polling loop ──────────────────────────────────────────────────
             was_online = False
             while not entry.stop_event.is_set():
                 try:
-                    is_online = self._is_contact_online(page)
+                    is_online = bw.call(lambda: self._is_contact_online(page))
                 except Exception:
                     is_online = False
 
@@ -693,7 +844,6 @@ class WhatsAppMonitor:
                     self.root.after(0, lambda: self._update_contact_status(entry, "online"))
                     self.root.after(0, lambda n=nm: self._log(f"🟢 {n} is now online!"))
                     self._notify(nm)
-
                 elif not is_online and was_online:
                     was_online = False
                     self.root.after(0, lambda: self._update_contact_status(entry, "monitoring"))
@@ -701,9 +851,13 @@ class WhatsAppMonitor:
 
                 entry.stop_event.wait(timeout=3)
 
+            # ── Stopped — clean up tab ────────────────────────────────────────
+            bw.close_page(page)
+            entry.page = None
+
         except Exception as exc:
             msg = str(exc)
-            self.root.after(0, lambda: self._log(f"ERROR [{entry.name}]: {msg}"))
+            self.root.after(0, lambda: self._log(f"ERROR [{nm}]: {msg}"))
             self.root.after(0, lambda: self._update_contact_status(entry, "error"))
 
     # ── WhatsApp Web helpers ──────────────────────────────────────────────────
@@ -747,32 +901,102 @@ class WhatsAppMonitor:
         return false;
     }"""
 
+    # Search box MUST be inside #pane-side (left panel) to avoid matching
+    # the in-chat search box on the right panel.
+    _SEARCH_SEL = (
+        '#pane-side div[contenteditable="true"], '
+        '#pane-side [data-testid="chat-list-search"]'
+    )
+    # Fallbacks if #pane-side isn't found yet
+    _SEARCH_SEL_FALLBACK = (
+        'div[contenteditable="true"][data-tab="3"], '
+        'div[contenteditable="true"][aria-label*="Search" i]'
+    )
+
     def _open_chat(self, page, name: str) -> bool:
+        """
+        Open a chat by contact name.  Four strategies, most-specific first.
+        """
         self._dismiss_restore_dialog(page)
 
-        # Strategy 1: find span[title] matching the name
+        # ── Pre-step: make sure we're viewing the contact list, not a chat ───
+        for _ in range(3):
+            try:
+                page.keyboard.press("Escape")
+                time.sleep(0.25)
+            except Exception:
+                pass
+        time.sleep(0.5)
+
+        # ── Strategy 1: click a visible span[title] directly in the list ─────
         try:
             if page.evaluate(self._JS_CLICK, name):
-                time.sleep(1.5)
+                time.sleep(1.2)
                 return True
         except Exception:
             pass
 
-        # Strategy 2: use the search box
+        # ── Strategy 2: type in the LEFT-PANEL search box ────────────────────
+        for attempt in range(2):
+            search = None
+            # Try scoped selector first, then fall back
+            for sel in (self._SEARCH_SEL, self._SEARCH_SEL_FALLBACK):
+                try:
+                    search = page.wait_for_selector(sel, timeout=5_000)
+                    if search:
+                        break
+                except Exception:
+                    pass
+
+            if search:
+                try:
+                    search.click()
+                    time.sleep(0.3)
+                    # Select-all + type  (replaces any existing text)
+                    page.keyboard.press("Control+a")
+                    page.keyboard.type(name, delay=70)
+                    time.sleep(3.0)
+
+                    # ── Try Playwright locator first (handles retries) ────────
+                    try:
+                        loc = page.locator(f'#pane-side span[title="{name}"]').first
+                        if loc.is_visible(timeout=2_000):
+                            loc.click()
+                            time.sleep(1.2)
+                            return True
+                    except Exception:
+                        pass
+
+                    # ── Fall back to JS click (case-insensitive) ──────────────
+                    if page.evaluate(self._JS_CLICK, name):
+                        time.sleep(1.2)
+                        return True
+
+                    # ── Last resort: press Enter and verify header ────────────
+                    try:
+                        page.keyboard.press("Enter")
+                        time.sleep(1.2)
+                        if page.query_selector('#main header'):
+                            return True
+                    except Exception:
+                        pass
+
+                except Exception:
+                    pass
+
+            # Between retries: clear state
+            try:
+                page.keyboard.press("Escape")
+                time.sleep(1.0)
+            except Exception:
+                pass
+
+        # ── Strategy 3: full reset → retry direct click ───────────────────────
         try:
-            search = page.wait_for_selector(
-                '[data-testid="chat-list-search"], '
-                'div[contenteditable="true"][data-tab="3"], '
-                'div[contenteditable="true"][aria-label*="Search"], '
-                '[title="Search input textbox"]',
-                timeout=6_000)
-            search.click()
-            time.sleep(0.4)
-            page.keyboard.press("Control+a")
-            page.keyboard.type(name, delay=80)
-            time.sleep(3)
+            page.keyboard.press("Escape")
+            time.sleep(2.0)
             if page.evaluate(self._JS_CLICK, name):
-                time.sleep(1.5)
+                time.sleep(1.2)
                 return True
         except Exception:
             pass
@@ -1224,16 +1448,9 @@ $n.Dispose()
         cfg["tg_token"]   = self.tg_token_var.get().strip()
         cfg["tg_chat_id"] = self.tg_chatid_var.get().strip()
         save_config(cfg)
-        try:
-            if self.browser:
-                self.browser.close()
-        except Exception:
-            pass
-        try:
-            if self._pw_ctx:
-                self._pw_ctx.stop()
-        except Exception:
-            pass
+        # Shut down the browser thread (closes Playwright + Chromium cleanly)
+        if self._bw:
+            self._bw.shutdown()
         self.root.destroy()
 
     def run(self):

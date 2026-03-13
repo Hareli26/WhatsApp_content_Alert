@@ -8,14 +8,15 @@ No console window. Runs silently in the background.
 
 ## ✨ Features
 
-- 🟢 **Real-time online detection** — polls WhatsApp Web every 3 seconds
-- 👥 **Multiple contacts** — monitor several people at the same time, each in their own browser tab
+- 🟢 **Real-time online detection** — polls WhatsApp Web every 3 seconds per contact
+- 👥 **Multiple contacts** — monitor several people at the same time, each in a dedicated browser tab
+- 🔄 **Stop & restart freely** — browser stays open between Stop/Start cycles, no re-login needed
 - 🔔 **Windows balloon notification** — pops up instantly when a contact comes online
 - ✈️ **Telegram bot notification** — sends a message to your Telegram
 - 📱 **Google Contacts autocomplete** — import your contacts from Google for quick name lookup
 - 🕓 **Recent contacts history** — one-click chips for contacts you've monitored before
 - 🔇 **No CLI window** — launches as a clean GUI app, no black console
-- 💾 **Persistent browser session** — WhatsApp Web stays logged in between uses
+- 💾 **Persistent browser session** — WhatsApp Web stays logged in between app restarts
 
 ---
 
@@ -50,12 +51,18 @@ Double-click **`run.bat`** to start the app.
 ### Monitoring contacts
 
 1. **Type a contact name** in the "Add contact" field and click **+ Add** (or press Enter)
-2. **Add as many contacts** as you want
+2. **Add as many contacts** as you want — each will get its own browser tab
 3. Click **▶ Start All** to begin monitoring
 4. The app opens WhatsApp Web in the background, finds each contact's chat, and watches for the "online" status
 5. The first time you run it, scan the **QR code** in the Chromium window to log in — after that it stays logged in automatically
 6. When a contact comes online: you get a **Windows notification** and a **Telegram message** (if configured)
-7. Click **■ Stop All** to stop monitoring
+7. Click **■ Stop All** to stop monitoring — the browser stays open, so clicking Start All again is instant
+
+### Tips for contact names
+
+- The name must match (or be part of) how the contact appears **in WhatsApp**, not in your phone's address book
+- If search fails, try a shorter version of the name (e.g. `"John"` instead of `"John Smith"`)
+- Hebrew names work — make sure to type them exactly as they appear in WhatsApp
 
 ### Status indicators
 
@@ -121,9 +128,15 @@ whatsapp_monitor/
 ## ❓ Troubleshooting
 
 ### "Contact not found"
-- Make sure the name **exactly matches** (or is part of) the contact name as it appears in WhatsApp
+- Make sure the name **matches** (fully or partially) how it appears in WhatsApp
 - The contact must have an **existing chat** with you in WhatsApp
-- Try using a partial name (e.g. `"John"` instead of `"John Smith"`)
+- Try a shorter partial name (e.g. `"John"` instead of `"John Smith"`)
+- The app tries 3 different search strategies automatically, including the WhatsApp search box
+
+### Only some contacts are found
+- Each contact gets its own browser tab — the app searches them one by one
+- If a contact is "Not found" but others work, check the exact spelling in WhatsApp
+- Click **Stop All** then **Start All** to retry all contacts
 
 ### WhatsApp Web QR code keeps appearing
 - Delete the **`wa_session/`** folder and re-scan the QR code
@@ -136,6 +149,10 @@ whatsapp_monitor/
 - Make sure Python is installed and in PATH
 - Try running `python app.py` from a terminal to see any error messages
 - Run `setup.bat` again to ensure all dependencies are installed
+
+### Stop All → Start All doesn't work
+- This is fixed in the current version — the browser thread stays alive between cycles
+- If you see "Browser launch error", close the app and restart it once
 
 ---
 
@@ -153,4 +170,4 @@ whatsapp_monitor/
 |---|---|
 | `playwright` | Controls the Chromium browser for WhatsApp Web |
 
-All other features use Python's built-in standard library (tkinter, urllib, threading, etc.).
+All other features use Python's built-in standard library (tkinter, urllib, threading, queue, etc.).
